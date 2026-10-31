@@ -1,183 +1,134 @@
-"""Stage 5: Mesh validation and export (.glb / .obj).
-
-Validates the reconstructed mesh (non-empty, volume, finite bounds,
-watertight flag, texture flag) and exports as .glb and .obj + .mtl.
-Also performs a round-trip check: re-opens the GLB to confirm it's valid.
-
-Uses trimesh for all mesh operations.
-"""
+"""Stage 5: validate reconstructed mesh and export .glb + .obj."""
 
 from __future__ import annotations
 
 import json
-import time
+import sys
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Dict, Optional, Union
 
 import trimesh
 
-
-MESH_VALIDATION_CHECKS = {
-    "non_empty": lambda m: len(m.vertices) > 0,
-    "has_volume": lambda m: m.volume > 0.001,
-    "finite_bounds": lambda m: m.bounds[1].max() - m.bounds[0].min() > 0,
-    "watertight": lambda m: m.is_watertight,
-    "has_faces": lambda m: len(m.faces) > 0,
-    "max_faces": lambda m: len(m.faces) <= 100_000,
-    "max_vertices": lambda m: len(m.vertices) <= 200_000,
-}
+PathLike = Union[str, Path]
 
 
-def validate_mesh(mesh: trimesh.Trimesh) -> Dict[str, bool]:
-    """Run validation checks on a trimesh Trimesh object.
-
-    Args:
-        mesh: A trimesh Trimesh instance.
-
-    Returns:
-        dict mapping check name to bool result.
-    """
-    results = {}
-    for name, check_fn in MESH_VALIDATION_CHECKS.items():
-        try:
-            results[name] = check_fn(mesh)
-        except Exception:
-            results[name] = False
-    return results
+class MeshExportError(ValueError):
+    """Mesh failed mandatory geometry checks."""
 
 
-def export_glb(
-    mesh: trimesh.Trimesh,
-    output_path: Path,
-    *,
-    maintain_order: bool = False,
-) -> Path:
-    """Export a mesh to .glb format.
-
-    Args:
-        mesh: trimesh Trimesh object.
-        output_path: Path where the .glb file will be written.
-        maintain_order: If True, preserve original vertex order (may be slower).
-
-    Returns:
-        Path to the exported .glb file.
-    """
-    # Export as GLB
-    mesh.export(str(output_path), maintain_order=maintain_order)
-    return output_path
+def load_mesh(path: PathLike) -> trimesh.Trimesh:
+    loaded = trimesh.load(str(path), process=False, force="mesh")
+    if isinstance(loaded, trimesh.Scene):
+        geoms = [g for g in loaded.geometry.values() if isinstance(g, trimesh.Trimesh)]
+        if not geoms:
+            raise MeshExportError(f"No triangle mesh inside {path}")
+        loaded = trimesh.util.concatenate(geoms)
+    if not isinstance(loaded, trimesh.Trimesh):
+        raise MeshExportError(f"Could not load a triangle mesh from {path}")
+    return loaded
 
 
-def export_obj(
-    mesh: trimesh.Trimesh,
-    output_path: Path,
-    texture_path: Optional[Path] = None,
-) -> Dict[str, Path]:
-    """Export a mesh to .obj + .mtl, optionally with texture.
-
-    Args:
-        mesh: trimesh Trimesh object.
-        output_path: Base path (without extension) for .obj output.
-        texture_path: Optional path to a .png texture map.
-
-    Returns:
-        dict with keys "obj", "mtl", and optionally "texture" paths.
-    """
-    obj_path = output_path.with_suffix(".obj")
-    mtl_path = output_path.with_suffix(".mtl")
-
-    # Write OBJ with materials
-    mesh.export(str(obj_path), file_type="obj")
-
-    # If texture provided, we'd handle UV mapping here
-    # For now, just export without explicit material
-    if texture_path and texture_path.exists():
-        # TODO: bake texture onto mesh
-        pass
-
-    return {"obj": obj_path, "mtl": mtl_path}
-
-
-def roundtrip_glb(glb_path: Path) -> bool:
-    """Re-open a GLB file to verify it's valid (round-trip check).
-
-    Args:
-        glb_path: Path to the .glb file.
-
-    Returns:
-        True if the file opens successfully in trimesh.
-    """
+def mesh_stats(mesh: trimesh.Trimesh) -> Dict[str, Any]:
+    extents = mesh.extents
+    min_e = float(extents.min()) if extents is not None else 0.0
+    max_e = float(extents.max()) if extents is not None else 0.0
+    flatness = min_e / (max_e + 1e-12)
+    volume = None
     try:
-        mesh = trimesh.load(str(glb_path), file_type="glb")
-        return mesh is not None and not mesh.empty
+        if mesh.is_watertight:
+            volume = float(mesh.volume)
+    except Exception:
+        volume = None
+    has_texture = bool(
+        getattr(getattr(mesh, "visual", None), "uv", None) is not None
+        or getattr(getattr(mesh, "visual", None), "material", None) is not None
+    )
+    return {
+        "vertices": int(len(mesh.vertices)),
+        "faces": int(len(mesh.faces)),
+        "is_watertight": bool(mesh.is_watertight),
+        "volume": volume,
+        "bounds_min": mesh.bounds[0].tolist() if mesh.bounds is not None else None,
+        "bounds_max": mesh.bounds[1].tolist() if mesh.bounds is not None else None,
+        "extents": extents.tolist() if extents is not None else None,
+        "flatness_ratio": float(flatness),
+        "has_texture": has_texture,
+        "finite_vertices": bool(mesh.vertices.size and np_all_finite(mesh.vertices)),
+    }
+
+
+def np_all_finite(values) -> bool:
+    import numpy as np
+
+    return bool(np.isfinite(values).all())
+
+
+def validate_mesh(mesh: trimesh.Trimesh) -> Dict[str, Any]:
+    stats = mesh_stats(mesh)
+    checks = {
+        "non_empty": stats["vertices"] > 0 and stats["faces"] > 0,
+        "finite_bounds": stats["finite_vertices"] and stats["extents"] is not None,
+        "has_volume_or_depth": stats["flatness_ratio"] >= 0.04,
+        "not_a_flat_plane": stats["flatness_ratio"] >= 0.04,
+    }
+    if stats["volume"] is not None:
+        checks["positive_volume"] = stats["volume"] > 1e-8
+    return {"checks": checks, "stats": stats, "valid": all(checks.values())}
+
+
+def roundtrip_glb(glb_path: PathLike) -> bool:
+    try:
+        mesh = load_mesh(glb_path)
+        return len(mesh.vertices) > 0 and len(mesh.faces) > 0
     except Exception:
         return False
 
 
-def run_pipeline(
-    input_data: Dict[str, Any],
+def export_assets(
+    mesh_or_path: Union[trimesh.Trimesh, PathLike],
+    output_dir: PathLike,
     *,
-    output_dir: str = "outputs",
+    texture_path: Optional[PathLike] = None,
 ) -> Dict[str, Any]:
-    """Run the full export validation pipeline on a reconstructed mesh.
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    mesh = mesh_or_path if isinstance(mesh_or_path, trimesh.Trimesh) else load_mesh(mesh_or_path)
+    report = validate_mesh(mesh)
+    if not report["valid"]:
+        raise MeshExportError(
+            "Mesh rejected as flat or empty. Re-run with another seed; "
+            f"checks={report['checks']}"
+        )
 
-    Args:
-        input_data: dict containing at least "mesh" (trimesh.Trimesh)
-            and optionally "texture_path".
-        output_dir: Where to write the .glb and .obj files.
+    glb_path = out / "model.glb"
+    obj_path = out / "model.obj"
+    mesh.export(str(glb_path))
+    mesh.export(str(obj_path))
+    if not roundtrip_glb(glb_path):
+        raise MeshExportError(f"Exported GLB could not be re-opened: {glb_path}")
 
-    Returns:
-        dict with:
-            - "mesh": the validated/trimesh mesh object (or original if invalid)
-            - "glb_path": path to the exported .glb
-            - "obj_path": path to the exported .obj
-            - "report_json_path": path to report.json
-            - "valid": whether all checks passed
-            - "roundtrip_valid": whether GLB round-trip check passed
-    """
-    output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-
-    mesh = input_data.get("mesh")
-    texture_path = input_data.get("texture_path")
-
-    if mesh is None or not isinstance(mesh, trimesh.Trimesh):
-        raise ValueError("Input must contain a valid trimesh.Trimesh object")
-
-    # Validation
-    checks = validate_mesh(mesh)
-    valid = all(checks.values())
-
-    # Export
-    glb_path = output / "model.glb"
-    obj_path = output / "model.obj"
-
-    export_glb(mesh, glb_path)
-    export_obj(mesh, obj_path, texture_path=texture_path)
-
-    # Round-trip check
-    roundtrip_valid = roundtrip_glb(glb_path)
-
-    # Write report.json
-    report = {
-        "checks": checks,
-        "valid": valid,
-        "roundtrip_valid": roundtrip_valid,
-        "vertices": len(mesh.vertices),
-        "faces": len(mesh.faces),
-        "volume": float(mesh.volume) if hasattr(mesh, "volume") else None,
-        "timestamp": time.time(),
+    payload = {
+        "glb_path": str(glb_path),
+        "obj_path": str(obj_path),
+        "texture_path": str(texture_path) if texture_path else None,
+        "roundtrip_valid": True,
+        **report,
     }
+    return payload
 
-    report_path = output / "report.json"
-    with open(report_path, "w") as f:
-        json.dump(report, f, indent=2)
 
-    return {
-        "mesh": mesh,
-        "glb_path": glb_path,
-        "obj_path": obj_path,
-        "report_json_path": report_path,
-        "valid": valid,
-        "roundtrip_valid": roundtrip_valid,
-        "checks": checks,
-    }
+def main(argv: Optional[list[str]] = None) -> int:
+    args = argv if argv is not None else sys.argv[1:]
+    if not args:
+        print("Usage: python -m sketch2shape.export path/to/model.glb", file=sys.stderr)
+        return 2
+    path = Path(args[0])
+    mesh = load_mesh(path)
+    report = validate_mesh(mesh)
+    report["roundtrip_valid"] = path.suffix.lower() in {".glb", ".gltf"} and roundtrip_glb(path)
+    print(json.dumps(report, indent=2))
+    return 0 if report["valid"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

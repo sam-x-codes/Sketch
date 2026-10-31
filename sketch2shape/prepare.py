@@ -1,101 +1,76 @@
-"""Stage 3: Background removal and foreground isolation.
-
-Uses rembg (U²-Net) to remove the background, then crops and scales
-the foreground so it centers and fills ~85% of the frame on white.
-"""
+"""Stage 3: rembg foreground isolation, then center/scale on white."""
 
 from __future__ import annotations
 
+from typing import Dict
+
 import cv2
 import numpy as np
-from typing import Dict, Any
 
-try:
+from .config import FOREGROUND_RATIO, INPUT_TARGET_SIZE
+
+
+class PrepareError(ValueError):
+    """Raised when rembg cannot isolate a foreground object."""
+
+
+def remove_background(image: np.ndarray) -> np.ndarray:
     from rembg import remove
-    REMBG_AVAILABLE = True
-except ImportError:
-    REMBG_AVAILABLE = False
 
-
-def remove_background(
-    image: np.ndarray,
-) -> np.ndarray:
-    """Remove background from an RGB image using rembg.
-
-    Args:
-        image: HxWx3 RGB uint8 array.
-
-    Returns:
-        RGBA numpy array with background removed (alpha channel included).
-    """
-    if not REMBG_AVAILABLE:
-        raise ImportError(
-            "rembg is not installed. Install with: pip install rembg"
-        )
-
-    rgba = remove(image)
-    return rgba
+    rgb = image
+    if rgb.ndim == 2:
+        rgb = cv2.cvtColor(rgb, cv2.COLOR_GRAY2RGB)
+    if rgb.shape[2] == 4:
+        rgb = rgb[:, :, :3]
+    rgba = remove(rgb)
+    return np.asarray(rgba)
 
 
 def center_and_scale_foreground(
     rgba: np.ndarray,
     *,
-    foreground_ratio: float = 0.85,
-    target_size: int = 512,
+    foreground_ratio: float = FOREGROUND_RATIO,
+    target_size: int = INPUT_TARGET_SIZE,
 ) -> Dict[str, np.ndarray]:
-    """Crop and scale the foreground so it centers and fills the frame.
-
-    Args:
-        rgba: HxWx4 RGBA array (foreground + alpha).
-        foreground_ratio: Foreground should fill approx this ratio of the frame.
-        target_size: Output square size in pixels.
-
-    Returns:
-        dict with keys:
-            - "foreground_rgb": HxWx3 RGB array, centered, scaled
-            - "foreground_mask": HxW binary mask of foreground
-            - "prepared_rgb": HxWx3 RGB array on white background, ready for 3D reconstruction
-    """
+    if rgba.shape[2] != 4:
+        raise PrepareError("Expected an RGBA image from rembg.")
     alpha = rgba[:, :, 3]
     rgb = rgba[:, :, :3]
+    mask = alpha > 12
+    if int(np.count_nonzero(mask)) < 80:
+        raise PrepareError(
+            "Could not isolate a foreground object — try another seed or add a short prompt."
+        )
 
-    # Find bounding box of non-transparent pixels
-    coords = np.argwhere(alpha > 0)
-    if coords.size == 0:
-        # No foreground - return white image
-        prepared = np.ones((target_size, target_size, 3), dtype=np.uint8) * 255
-        return {
-            "foreground_rgb": rgb,
-            "foreground_mask": alpha,
-            "prepared_rgb": prepared,
-        }
+    ys, xs = np.where(mask)
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    crop_rgb = rgb[y0:y1, x0:x1]
+    crop_a = alpha[y0:y1, x0:x1]
+    h, w = crop_rgb.shape[:2]
+    scale = (target_size * foreground_ratio) / float(max(h, w))
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    scaled_rgb = cv2.resize(crop_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    scaled_a = cv2.resize(crop_a, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    y_min, x_min = coords.min(axis=0)
-    y_max, x_max = coords.max(axis=0)
-    h, w = y_max - y_min + 1, x_max - x_min + 1
-
-    # Crop to foreground bbox
-    cropped = rgb[y_min : y_max + 1, x_min : x_max + 1]
-    cropped_alpha = alpha[y_min : y_max + 1, x_min : x_max + 1]
-
-    # Resize so that the longer side is target_size * foreground_ratio / (1 - some margin)
-    # Simple approach: resize so the bounding box fits in target_size with some padding
-    new_h, new_w = target_size, target_size
-
-    # Scale the cropped image
-    scaled = cv2.resize(cropped, (target_size, target_size), interpolation=cv2.INTER_AREA)
-
-    # Create white background
-    prepared = np.ones((target_size, target_size, 3), dtype=np.uint8) * 255
-
-    # Center the scaled image
-    h_s, w_s = scaled.shape[:2]
-    y_offset = (target_size - h_s) // 2
-    x_offset = (target_size - w_s) // 2
-    prepared[y_offset : y_offset + h_s, x_offset : x_offset + w_s] = scaled
-
+    prepared = np.full((target_size, target_size, 3), 255, dtype=np.uint8)
+    rgba_out = np.zeros((target_size, target_size, 4), dtype=np.uint8)
+    oy = (target_size - new_h) // 2
+    ox = (target_size - new_w) // 2
+    a = (scaled_a.astype(np.float32) / 255.0)[..., None]
+    region = prepared[oy : oy + new_h, ox : ox + new_w].astype(np.float32)
+    blended = scaled_rgb.astype(np.float32) * a + region * (1.0 - a)
+    prepared[oy : oy + new_h, ox : ox + new_w] = np.clip(blended, 0, 255).astype(np.uint8)
+    rgba_out[oy : oy + new_h, ox : ox + new_w, :3] = scaled_rgb
+    rgba_out[oy : oy + new_h, ox : ox + new_w, 3] = scaled_a
     return {
-        "foreground_rgb": scaled,
-        "foreground_mask": cropped_alpha,
         "prepared_rgb": prepared,
+        "prepared_rgba": rgba_out,
+        "foreground_mask": scaled_a,
     }
+
+
+def prepare_image(image: np.ndarray) -> Dict[str, np.ndarray]:
+    rgba = remove_background(image)
+    return center_and_scale_foreground(rgba)

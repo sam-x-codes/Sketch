@@ -1,101 +1,105 @@
-"""Stage 4: Image-to-3D with texture.
-
-Uses InstantMesh (Zero123++ → LRM) to reconstruct a textured 3D mesh
-from a single prepared RGB image.
-
-This stage runs InstantMesh as an isolated subprocess to pin CUDA deps
-and free VRAM after each run.
-"""
+"""Stage 4: InstantMesh in an isolated subprocess (pinned CUDA env)."""
 
 from __future__ import annotations
 
-import json
+import os
 import subprocess
-import tempfile
-import cv2
+import sys
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
+
+import cv2
+import numpy as np
+
+from .config import get_settings
+
+
+class ReconstructError(RuntimeError):
+    """InstantMesh failed or produced no mesh."""
 
 
 def reconstruct_mesh(
     prepared_image: np.ndarray,
     *,
-    output_dir: str,
+    output_dir: str | Path,
+    seed: int = 42,
     config_path: Optional[str] = None,
-    instantmesh_dir: str = "",
+    timeout_s: int = 1200,
 ) -> Dict[str, Any]:
-    """Run InstantMesh to reconstruct a textured 3D mesh from an image.
+    settings = get_settings()
+    im_dir = Path(settings["instantmesh_dir"]).resolve()
+    if not (im_dir / "run.py").is_file():
+        raise ReconstructError(
+            f"InstantMesh not found at {im_dir}. Run: bash scripts/setup.sh"
+        )
 
-    Args:
-        prepared_image: HxWx3 RGB uint8 array, centered on white.
-        output_dir: Directory where mesh files will be saved.
-        config_path: Path to InstantMesh config YAML.
-            Defaults to ``instant-mesh-large.yaml``.
-        instantmesh_dir: Path to the InstantMesh checkout.
-            If empty, uses ``INSTANTMESH_DIR`` env var or
-            ``third_party/InstantMesh`` relative to project root.
+    python = Path(settings["instantmesh_python"])
+    if not python.is_file():
+        python = Path(sys.executable)
 
-    Returns:
-        dict with keys:
-            - "mesh_path": path to the exported .obj (or .glb) file
-            - "texture_path": path to the texture map image
-            - "report": mesh statistics (vertices, faces, etc.)
-    """
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
+    rel_config = config_path or settings["instantmesh_config"]
+    cfg = Path(rel_config)
+    if not cfg.is_absolute():
+        cfg = im_dir / rel_config
+    if not cfg.is_file():
+        raise ReconstructError(f"InstantMesh config missing: {cfg}")
 
-    im_dir = Path(instantmesh_dir).resolve() if instantmesh_dir else Path(
-        os.getenv("INSTANTMESH_DIR", "third_party/InstantMesh")
-    ).resolve()
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    input_path = out / "instantmesh_input.png"
+    bgr = prepared_image[:, :, ::-1] if prepared_image.ndim == 3 else prepared_image
+    cv2.imwrite(str(input_path), bgr)
 
-    if config_path is None:
-        config_path = str(im_dir / "configs" / "instant-mesh-large.yaml")
+    im_out = out / "instantmesh"
+    im_out.mkdir(parents=True, exist_ok=True)
 
-    # Prepare the input image
-    with tempfile.NamedTemporaryFile(
-        suffix=".png", delete=False, dir=str(output_path)
-    ) as tmp:
-        tmp_path = tmp.name
-        img_bgr = prepared_image[:, :, ::-1]  # RGB -> BGR for OpenCV
-        cv2.imwrite(tmp_path, img_bgr)
-
-    # Run InstantMesh CLI
-    # The CLI typically accepts: instant-mesh <input_image> <output_dir> [flags]
     cmd = [
-        "python", "-m", "instant_mesh.run",
-        "--input_image", tmp_path,
-        "--output_dir", str(output_path),
-        "--config", config_path,
+        str(python),
+        "run.py",
+        str(cfg),
+        str(input_path.resolve()),
+        "--output_path",
+        str(im_out.resolve()),
+        "--export_texmap",
+        "--seed",
+        str(int(seed) if seed is not None and int(seed) >= 0 else 42),
     ]
 
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    print("Running InstantMesh:", " ".join(cmd), flush=True)
     try:
         result = subprocess.run(
             cmd,
-            capture_output=True,
-            text=True,
-            timeout=300,  # 5 min timeout
+            cwd=str(im_dir),
+            env=env,
+            timeout=timeout_s,
         )
-        # Parse output or report
-        report = {
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "returncode": result.returncode,
-        }
-    except subprocess.TimeoutExpired as e:
-        report = {
-            "stdout": e.stdout if e.stdout else "",
-            "stderr": e.stderr if e.stderr else "",
-            "timeout": True,
-        }
+    except subprocess.TimeoutExpired as exc:
+        raise ReconstructError(
+            f"InstantMesh timed out after {timeout_s}s. Try instant-mesh-base.yaml or S2S_LOW_VRAM=1."
+        ) from exc
 
-    # Find the generated mesh file
-    mesh_files = list(output_path.glob("*.obj")) + list(output_path.glob("*.glb"))
-    texture_files = list(output_path.glob("*.png")) + list(output_path.glob("*.jpg"))
+    if result.returncode != 0:
+        raise ReconstructError(
+            f"InstantMesh exited with code {result.returncode}. "
+            "Need an NVIDIA GPU with CUDA 12.1. See README troubleshooting."
+        )
 
-    result = {
-        "mesh_path": str(mesh_files[0]) if mesh_files else None,
-        "texture_path": str(texture_files[0]) if texture_files else None,
-        "report": report,
+    meshes = sorted((im_out).rglob("*.obj"))
+    meshes = [p for p in meshes if "meshes" in p.parts] or meshes
+    if not meshes:
+        raise ReconstructError(f"InstantMesh produced no .obj under {im_out}")
+
+    mesh_path = meshes[0]
+    texture = mesh_path.with_suffix(".png")
+    if not texture.is_file():
+        pngs = list(mesh_path.parent.glob("*.png"))
+        texture = pngs[0] if pngs else None
+
+    return {
+        "mesh_path": str(mesh_path),
+        "texture_path": str(texture) if texture else None,
+        "instantmesh_dir": str(im_out),
+        "command": cmd,
     }
-
-    return result

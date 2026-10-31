@@ -62,23 +62,23 @@ flowchart LR
 sketch2shape-ai/
 ├── app.py                    # Gradio web app (draw / upload / prompt / 3D preview / download)
 ├── run_pipeline.py           # Command-line entry point
-├── requirements.txt
+├── requirements.txt          # main app venv (newer Diffusers + Gradio 4)
 ├── scripts/
-│   ├── setup.sh              # one-shot environment + InstantMesh + weights setup
-│   └── download_weights.py   # pre-cache all model weights
-├── sketch2shape/
-│   ├── config.py             # models, prompts, paths (env-overridable)
-│   ├── preprocess.py         # stage 1
-│   ├── generate.py           # stage 2
-│   ├── prepare.py            # stage 3
-│   ├── reconstruct.py        # stage 4
-│   ├── export.py             # stage 5
-│   └── pipeline.py           # orchestration, timings, report.json
-├── examples/
-│   ├── inputs/               # sample sketches
-│   └── outputs/              # sample .glb/.obj results (add yours here)
-└── third_party/InstantMesh/  # cloned by setup.sh
+│   ├── setup.sh              # two venvs + InstantMesh (pinned) + weights
+│   ├── download_weights.py
+│   └── make_example_sketches.py
+├── sketch2shape/             # five pipeline stages + orchestration
+├── examples/inputs/          # chair.png, mug.png, car.png
+├── examples/outputs/         # copy a GPU run here before submission
+└── third_party/InstantMesh/  # cloned by setup.sh (gitignored)
 ```
+
+Two virtualenvs keep CUDA pins from colliding:
+
+| Env | Purpose |
+|---|---|
+| `.venv` | Gradio app, OpenCV, rembg, SD 1.5 + ControlNet (current Diffusers) |
+| `.venv-instantmesh` | InstantMesh `run.py` with its own `diffusers==0.20.2` + nvdiffrast |
 
 ## 5. Hardware assumptions and runtime
 
@@ -89,48 +89,39 @@ sketch2shape-ai/
 |---|---|---|
 | OS | Ubuntu 22.04 | Ubuntu 20.04 / WSL2 |
 | Python | 3.10 | 3.10 |
-| GPU | NVIDIA, ≥ 24 GB VRAM, CUDA 12.1 | NVIDIA 12–16 GB with `S2S_LOW_VRAM=1` |
+| GPU | NVIDIA, ≥ 24 GB VRAM, CUDA 12.1 | NVIDIA 12–16 GB with `S2S_LOW_VRAM=1` and `instant-mesh-base.yaml` |
 | RAM | 32 GB | 16 GB |
 | Disk | ~25 GB (weights + env) | ~25 GB |
 | Internet | Needed once for `setup.sh` | — |
 
 | Measured on `<your GPU>` | Time |
 |---|---|
-| Preprocess | _fill_ s |
+| Preprocess | _fill from report.json_ s |
 | SD + ControlNet (25 steps) | _fill_ s |
 | Background removal | _fill_ s |
 | InstantMesh reconstruction | _fill_ s |
 | Validate + export | _fill_ s |
 | **Total** | **_fill_ s** |
 
-CPU-only is not supported for stage 4 (InstantMesh requires CUDA / nvdiffrast).
+CPU-only and Apple Silicon are **not** supported for stage 4 (InstantMesh needs CUDA + nvdiffrast). On a Mac you can install the UI and run preprocess checks; copy the repo to an NVIDIA Linux box for a full generation.
 
 ## 6. Installation
 
 ```bash
 git clone <your-repo-url> sketch2shape-ai
 cd sketch2shape-ai
-bash scripts/setup.sh          # venv, PyTorch cu121, xformers, InstantMesh, requirements, weights
+bash scripts/setup.sh          # two venvs, PyTorch cu121, InstantMesh @ 8079d91, weights
 source .venv/bin/activate
 ```
 
-Manual setup, if you prefer:
-
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu121
-pip install xformers==0.0.22.post7 --index-url https://download.pytorch.org/whl/cu121
-git clone https://github.com/TencentARC/InstantMesh.git third_party/InstantMesh
-pip install -r third_party/InstantMesh/requirements.txt
-pip install -r requirements.txt
-python scripts/download_weights.py
-```
+`setup.sh` clones InstantMesh and checks out `8079d9136d738e2c016f4ba4a6bc916d52147761`.
 
 Environment variables (all optional):
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `INSTANTMESH_DIR` | `third_party/InstantMesh` | Location of the InstantMesh checkout |
+| `INSTANTMESH_PYTHON` | `.venv-instantmesh/bin/python` | Interpreter that runs InstantMesh |
 | `INSTANTMESH_CONFIG` | `configs/instant-mesh-large.yaml` | Use `instant-mesh-base.yaml` for lower VRAM |
 | `S2S_LOW_VRAM` | `0` | `1` = CPU offload for SD and unload before reconstruction |
 | `S2S_OUTPUT_DIR` | `outputs/` | Where runs are saved |
@@ -224,15 +215,16 @@ product sketches; the app only processes user-supplied sketches and a fixed prom
 - [x] Weight pre-fetch script (`scripts/download_weights.py`)
 - [x] Seeds exposed (`--seed`, UI field) for repeatable generations
 - [x] Automatic mesh validation + GLB round-trip on every run
-- [ ] Add 2–3 sample inputs to `examples/inputs/` and their results to `examples/outputs/`
-- [ ] Fill measured timing/hardware table (section 5)
-- [ ] Pin the InstantMesh commit you tested in `scripts/setup.sh`
+- [x] Sample sketches in `examples/inputs/` (`chair.png`, `mug.png`, `car.png`)
+- [x] InstantMesh pinned to `8079d9136d738e2c016f4ba4a6bc916d52147761` in `scripts/setup.sh`
+- [ ] Copy one GPU run into `examples/outputs/` (`.glb` / `.obj` / `report.json`)
+- [ ] Fill measured timing/hardware table (section 5) from that `report.json`
 
 ## 12. Team
 
 | Name | Role |
 |---|---|
-| _your names_ | _roles_ |
+| Prayash Prasad Panda | Engineering |
 
 ## 13. Acknowledgements
 

@@ -1,102 +1,133 @@
-"""Stage 2: Sketch-guided image generation.
-
-Uses Stable Diffusion 1.5 + ControlNet scribble to generate an image
-conditioned on the sketch's contours, with an optional text prompt.
-"""
+"""Stage 2: Stable Diffusion 1.5 + ControlNet scribble."""
 
 from __future__ import annotations
 
+from typing import Any, Dict, Optional
+
 import numpy as np
-import torch
-from typing import Dict, Any
+from PIL import Image
 
 from .config import (
-    SD_MODEL_NAME,
-    CONTROLNET_SKRIBBLE_NAME,
+    CONTROLNET_SCRIBBLE_NAME,
+    DEFAULT_PROMPT,
     PROMPT_SUFFIX,
-    STAGES,
-    get_env_vars,
+    SD_GUIDANCE,
+    SD_MODEL_NAME,
+    SD_STEPS,
+    get_settings,
 )
 
+_PIPE = None
 
-def _get_pipeline():
-    """Load SD + ControlNet pipeline on demand."""
-    from diffusers import StableDiffusionControlNetPipeline
 
-    env = get_env_vars()
-    low_vram = env.get("S2S_LOW_VRAM", "0") == "1"
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def _dtype_device():
+    import torch
 
-    pipeline = StableDiffusionControlNetPipeline.from_pretrained(
-        SD_MODEL_NAME,
-        controlnet=CONTROLNET_SKRIBBLE_NAME,
-        safety_checker=None,
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+    if torch.cuda.is_available():
+        return torch.float16, "cuda"
+    return torch.float32, "cpu"
+
+
+def _load_pipeline():
+    global _PIPE
+    if _PIPE is not None:
+        return _PIPE
+
+    import torch
+    from diffusers import (
+        ControlNetModel,
+        StableDiffusionControlNetPipeline,
+        UniPCMultistepScheduler,
     )
 
-    if low_vram:
-        pipeline.enable_xformers_memory_efficient_attention()
-        pipeline.to("cpu")
-        pipeline.enable_sequential_cpu_offload()
+    settings = get_settings()
+    dtype, device = _dtype_device()
+    controlnet = ControlNetModel.from_pretrained(CONTROLNET_SCRIBBLE_NAME, torch_dtype=dtype)
+    pipe = StableDiffusionControlNetPipeline.from_pretrained(
+        SD_MODEL_NAME,
+        controlnet=controlnet,
+        safety_checker=None,
+        requires_safety_checker=False,
+        torch_dtype=dtype,
+    )
+    pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
+    if settings["low_vram"] and device == "cuda":
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+        except Exception:
+            pass
+        pipe.enable_model_cpu_offload()
     else:
-        pipeline.to(device)
+        pipe.to(device)
+        if device == "cuda":
+            try:
+                pipe.enable_xformers_memory_efficient_attention()
+            except Exception:
+                pass
+    _PIPE = pipe
+    return pipe
 
-    return pipeline
+
+def unload_generator() -> None:
+    """Free SD/ControlNet VRAM before InstantMesh starts."""
+    global _PIPE
+    import torch
+
+    if _PIPE is None:
+        return
+    try:
+        _PIPE.to("cpu")
+    except Exception:
+        pass
+    del _PIPE
+    _PIPE = None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
 def generate_image(
-    sketch_control_map: np.ndarray,
+    control_map: np.ndarray,
     prompt: str = "",
     *,
-    num_inference_steps: int = 25,
-    guidance_scale: float = 7.5,
+    num_inference_steps: int = SD_STEPS,
+    guidance_scale: float = SD_GUIDANCE,
     seed: int = -1,
+    control_scale: float = 1.0,
 ) -> Dict[str, Any]:
-    """Generate a sketch-guided image using SD + ControlNet.
+    user = (prompt or "").strip() or DEFAULT_PROMPT
+    effective = f"{user}{PROMPT_SUFFIX}"
+    negative = (
+        "multiple objects, cropped, out of frame, blurry, watermark, text, "
+        "deformed, cluttered background, low quality"
+    )
 
-    Args:
-        sketch_control_map: HxW binary control map (white strokes on black).
-        prompt: Optional text prompt. If empty, uses default suffix.
-        num_inference_steps: Diffusion steps.
-        guidance_scale: Classifier-free guidance scale.
-        seed: Random seed (-1 for random).
+    control = control_map
+    if control.ndim == 2:
+        control = np.stack([control] * 3, axis=-1)
+    control_pil = Image.fromarray(control.astype(np.uint8)).convert("RGB").resize((512, 512))
 
-    Returns:
-        dict with keys:
-            - "image": generated RGB numpy array (H, W, 3)
-            - "control_map": the input control map
-            - "prompt": the effective prompt used
-    """
-    if not prompt:
-        prompt = PROMPT_SUFFIX.lstrip(", ")
+    import torch
 
-    effective_prompt = f"masterpiece, best quality, {prompt}{PROMPT_SUFFIX}"
+    pipe = _load_pipeline()
+    generator: Optional[torch.Generator] = None
+    if seed is not None and int(seed) >= 0:
+        gen_device = "cuda" if torch.cuda.is_available() else "cpu"
+        generator = torch.Generator(device=gen_device).manual_seed(int(seed))
 
-    pipeline = _get_pipeline()
-
-    generator = torch.Generator(device=pipeline.device)
-    if seed >= 0:
-        generator.manual_seed(seed)
-
-    # ControlNet expects HWC image with 3 channels
-    control_hwc = np.stack([sketch_control_map.astype(np.uint8)] * 3, axis=-1)
-
-    with torch.no_grad():
-        images = pipeline(
-            prompt=effective_prompt,
-            image=control_hwc,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            generator=generator,
-            controlnet_conditioning_scale=1.0,
-        ).images
-
-    img_array = np.asarray(images[0])
-    if img_array.shape[2] == 4:
-        img_array = img_array[:, :, :3]
-
+    result = pipe(
+        prompt=effective,
+        negative_prompt=negative,
+        image=control_pil,
+        num_inference_steps=int(num_inference_steps),
+        guidance_scale=float(guidance_scale),
+        controlnet_conditioning_scale=float(control_scale),
+        generator=generator,
+    )
+    image = result.images[0].convert("RGB")
     return {
-        "image": img_array,
-        "control_map": sketch_control_map,
-        "prompt": effective_prompt,
+        "image": np.asarray(image, dtype=np.uint8),
+        "prompt": effective,
+        "seed": int(seed),
+        "control_scale": float(control_scale),
     }

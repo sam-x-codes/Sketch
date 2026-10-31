@@ -1,141 +1,155 @@
-"""Gradio web app for Sketch2Shape AI.
-
-Draw on the canvas or upload a sketch, optionally add a text prompt,
-and generate a textured 3D model (.glb + .obj) with an interactive
-preview in the browser.
-"""
+"""Gradio UI: draw or upload a sketch, preview and download a 3D asset."""
 
 from __future__ import annotations
 
-import os
-import uuid
-import time
 import json
-import numpy as np
+from typing import Any, Optional
+
 import gradio as gr
 
-from .pipeline import run_pipeline
-from .config import DEFAULT_OUTPUT_DIR
+from sketch2shape.pipeline import run_pipeline
+from sketch2shape.preprocess import SketchError, to_rgb_uint8
 
 
-def launch_app():
-    """Launch the Gradio web interface."""
-    with gr.Blocks(title="Sketch2Shape AI", css=".gradio-container {max-width: 1200px !important}") as app:
-        gr.Markdown("# Sketch2Shape AI\nFrom a 2D sketch to a 3D asset")
+def _has_pixels(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, dict):
+        return any(value.get(k) is not None for k in ("composite", "image", "value", "background"))
+    return True
 
+
+def generate_3d(
+    sketch: Any,
+    uploaded: Any,
+    prompt: str,
+    seed: float,
+    control_scale: float,
+    progress=gr.Progress(track_tqdm=False),
+):
+    try:
+        if _has_pixels(uploaded):
+            image = to_rgb_uint8(uploaded)
+        elif _has_pixels(sketch):
+            image = to_rgb_uint8(sketch)
+        else:
+            raise SketchError("Draw a sketch or upload an image first.")
+        seed_i = int(seed)
+        status_messages = []
+
+        def on_progress(message: str) -> None:
+            status_messages.append(message)
+            try:
+                progress(len(status_messages) / 5.0, desc=message)
+            except Exception:
+                pass
+
+        result = run_pipeline(
+            image,
+            prompt=prompt or "",
+            seed=seed_i,
+            control_scale=float(control_scale),
+            progress=on_progress,
+        )
+        stages = result["stages"]
+        total = sum(stages.values())
+        hw = result.get("hardware") or {}
+        status = (
+            "Pipeline complete.\n\n"
+            f"- Preprocess: {stages.get('preprocess', 0):.1f}s\n"
+            f"- SD + ControlNet: {stages.get('generate', 0):.1f}s\n"
+            f"- Background removal: {stages.get('prepare', 0):.1f}s\n"
+            f"- InstantMesh: {stages.get('reconstruct', 0):.1f}s\n"
+            f"- Validate + export: {stages.get('export', 0):.1f}s\n"
+            f"- **Total: {total:.1f}s**\n\n"
+            f"GPU: {hw.get('gpu', 'unknown')} · VRAM: {hw.get('vram_gb', 'n/a')} GB\n"
+            f"Output: `{result['output_dir']}`"
+        )
+        report_text = json.dumps(result.get("report", {}), indent=2)
+        return (
+            status,
+            result["sketch_path"],
+            result["control_map_path"],
+            result["generated_path"],
+            result["prepared_path"],
+            result["glb_path"],
+            result["glb_path"],
+            result["obj_path"],
+            report_text,
+        )
+    except Exception as exc:
+        raise gr.Error(str(exc)) from exc
+
+
+def build_app() -> gr.Blocks:
+    with gr.Blocks(title="Sketch2Shape AI", theme=gr.themes.Soft()) as demo:
+        gr.Markdown(
+            """
+# Sketch2Shape AI
+Draw a rough 2D sketch **or** upload an image, optionally add a prompt, and generate a textured 3D model (`.glb` + `.obj`).
+Upload takes priority over the canvas. A prompt is never required.
+            """
+        )
         with gr.Row():
             with gr.Column(scale=1):
-                sketch_input = gr.Sketchpad(
-                    label="Draw or erase your sketch",
+                sketch = gr.Sketchpad(
+                    label="Draw (brush / eraser / clear)",
                     type="numpy",
-                    height=512,
-                    interactive=True,
+                    height=480,
                 )
-                upload_input = gr.Image(
-                    label="Or upload a sketch image",
+                uploaded = gr.Image(
+                    label="Or upload a sketch (PNG / JPG / WEBP)",
                     sources=["upload"],
                     type="numpy",
-                    visible=True,
+                    height=240,
                 )
-                prompt_input = gr.Textbox(
-                    label="Optional prompt (e.g. 'red leather armchair, matte finish')",
-                    placeholder="e.g. red leather armchair, matte finish",
-                    value="",
-                    scale=4,
+                prompt = gr.Textbox(
+                    label="Optional prompt",
+                    placeholder="red leather armchair, matte finish",
                 )
+                with gr.Row():
+                    seed = gr.Number(label="Seed (-1 = random)", value=42, precision=0)
+                    control_scale = gr.Slider(
+                        label="Sketch adherence",
+                        minimum=0.4,
+                        maximum=1.5,
+                        value=1.0,
+                        step=0.05,
+                    )
                 generate_btn = gr.Button("Generate 3D", variant="primary")
-
             with gr.Column(scale=1):
-                status_output = gr.Markdown(label="Status")
-                progress = gr.Bar(
-                    label="Progress", visible=False, interactive=False
-                )
-                report_json = gr.Code(label="Report (JSON)", language="json")
-
-        with gr.Row(vISIBLE=False) as model_row:
-            model_3d = gr.Model3D(
-                label="3D Preview",
-                height=500,
-                interactive=True,
-            )
-
+                status = gr.Markdown("Ready.")
+                model = gr.Model3D(label="Interactive 3D preview", height=420)
+                with gr.Row():
+                    glb = gr.File(label="Download .glb")
+                    obj = gr.File(label="Download .obj")
         with gr.Row():
-            with gr.Column():
-                glb_output = gr.File(label="Download .glb", visible=False)
-                obj_output = gr.File(label="Download .obj", visible=False)
-
-        # Logic
+            sketch_clean = gr.Image(label="01 sketch clean")
+            control_map = gr.Image(label="02 control map")
+            generated = gr.Image(label="03 generated")
+            prepared = gr.Image(label="04 prepared")
+        report = gr.Code(label="report.json", language="json")
         generate_btn.click(
-            fn=_handle_generate,
-            inputs=[sketch_input, upload_input, prompt_input],
+            fn=generate_3d,
+            inputs=[sketch, uploaded, prompt, seed, control_scale],
             outputs=[
-                status_output,
-                model_3d,
-                glb_output,
-                obj_output,
-                report_json,
+                status,
+                sketch_clean,
+                control_map,
+                generated,
+                prepared,
+                model,
+                glb,
+                obj,
+                report,
             ],
         )
-
-        # When upload changes, hide sketchpad or keep both usable
-        upload_input.input(
-            fn=lambda: gr.update(visible=False),
-            inputs=[],
-            outputs=sketch_input,
+        gr.Markdown(
+            "TechZephyr 4.0 · local models only after the one-time weight download. "
+            "Needs an NVIDIA GPU for InstantMesh."
         )
-
-    return app
-
-
-def _handle_generate(
-    sketch: np.ndarray | None,
-    uploaded: np.ndarray | None,
-    prompt: str,
-) -> tuple:
-    """Handle the Generate 3D button click.
-
-    Priority: uploaded image over sketch drawing.
-    """
-    # Use uploaded image if provided, otherwise sketch drawing
-    if uploaded is not None:
-        input_image = uploaded
-    elif sketch is not None:
-        input_image = sketch
-    else:
-        raise gr.Error("Please draw a sketch or upload an image first.")
-
-    # Run pipeline
-    with gr.Spinner("Running pipeline..."):
-        output = run_pipeline(
-            input_image,
-            prompt=prompt or "",
-            seed=-1,
-            output_dir=str(uuid.uuid4()),
-        )
-
-    # Update UI
-    status = f"""Pipeline complete ✅
-- Preprocess: {output["stages"].get("preprocess", 0):.1f}s
-- Generate: {output["stages"].get("generate", 0):.1f}s
-- Prepare: {output["stages"].get("prepare", 0):.1f}s
-- Reconstruct: {output["stages"].get("reconstruct", 0):.1f}s
-- Export: {output["stages"].get("export", 0):.1f}s
-- Total: {sum(output["stages"].values()):.1f}s"""
-    
-    # Load the generated 3D model
-    try:
-        model_3d = gr.update(
-            value=str(output["glb_path"]),
-            visible=True,
-        )
-    except Exception:
-        model_3d = gr.update(visible=False)
-
-    return status, model_3d, gr.update(value=str(output["glb_path"]), visible=True), \
-           gr.update(value=str(output["obj_path"]), visible=True), \
-           gr.update(value=json.dumps(output.get("checks", {}), indent=2), visible=True)
+    return demo
 
 
 if __name__ == "__main__":
-    app = launch_app()
-    app.launch(server_name="localhost", server_port=7860)
+    build_app().launch(server_name="0.0.0.0", server_port=7860)

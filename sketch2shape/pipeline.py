@@ -1,148 +1,178 @@
-"""Stage orchestration, timing, and report.json generation.
-
-Ties together all five pipeline stages, records per-stage durations,
-and writes a ``report.json`` at the end of every run.
-"""
+"""Orchestrate the five stages, write artefacts, and emit report.json."""
 
 from __future__ import annotations
 
-import time
 import json
-import os
+import platform
+import shutil
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any, Callable, Dict, Optional
 
-from .config import STAGES, get_env_vars, DEFAULT_OUTPUT_DIR
+import cv2
+import numpy as np
 
-from .preprocess import preprocess_sketch
-from .generate import generate_image
-from .prepare import remove_background, center_and_scale_foreground
+from .config import STAGES, get_settings
+from .export import export_assets
+from .generate import generate_image, unload_generator
+from .prepare import prepare_image
+from .preprocess import preprocess_sketch, to_rgb_uint8
 from .reconstruct import reconstruct_mesh
-from .export import run_pipeline as export_pipeline, validate_mesh
 
 
-class PipelineTimer:
-    """Context manager that records elapsed seconds per stage name."""
+def _now_timer():
+    import time
 
-    def __init__(self, stage: str):
-        self.stage = stage
-        self.start: float | None = None
-        self.elapsed: float | None = None
+    return time.perf_counter()
 
-    def __enter__(self):
-        self.start = time.time()
-        return self
 
-    def __exit__(self, *_):
-        self.elapsed = time.time() - self.start
+def hardware_report() -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "os": platform.platform(),
+        "machine": platform.machine(),
+        "python": platform.python_version(),
+        "gpu": "none",
+        "vram_gb": None,
+    }
+    try:
+        import torch
+
+        info["torch"] = torch.__version__
+        info["cuda_available"] = bool(torch.cuda.is_available())
+        if torch.cuda.is_available():
+            info["gpu"] = torch.cuda.get_device_name(0)
+            props = torch.cuda.get_device_properties(0)
+            info["vram_gb"] = round(props.total_memory / (1024**3), 2)
+    except Exception as exc:
+        info["torch_error"] = str(exc)
+    return info
+
+
+def new_run_dir(base: Optional[Path] = None) -> Path:
+    settings = get_settings()
+    root = Path(base) if base else Path(settings["output_dir"])
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run = root / f"{stamp}-{uuid.uuid4().hex[:6]}"
+    run.mkdir(parents=True, exist_ok=True)
+    return run
+
+
+def _save_rgb(path: Path, image: np.ndarray) -> None:
+    bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR) if image.ndim == 3 else image
+    cv2.imwrite(str(path), bgr)
 
 
 def run_pipeline(
-    sketch_image: np.ndarray,
+    sketch_image: Any,
     *,
     prompt: str = "",
     seed: int = -1,
+    control_scale: float = 1.0,
     output_dir: str = "",
+    progress: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
-    """Run the full Sketch2Shape pipeline and return results + report.
+    def log(message: str) -> None:
+        print(message, flush=True)
+        if progress is not None:
+            progress(message)
 
-    Args:
-        sketch_image: HxWx3 or HxWx4 numpy array (canvas drawing or uploaded image).
-        prompt: Optional text prompt appended with default suffix.
-        seed: Random seed for diffusion (-1 for random).
-        output_dir: Output directory for this run. If empty, uses S2S_OUTPUT_DIR
-            env var or ``outputs/``.
+    if output_dir:
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+    else:
+        out = new_run_dir()
 
-    Returns:
-        dict with:
-            - "stages": dict mapping stage name to elapsed seconds
-            - "report_json_path": path to the written report.json
-            - "output_dir": final output directory
-            - all intermediate artifacts (generated image, prepared image, etc.)
-    """
-    if not output_dir:
-        env = get_env_vars()
-        output_dir = env.get("S2S_OUTPUT_DIR", DEFAULT_OUTPUT_DIR)
-    out = Path(output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    timings: Dict[str, float] = {}
+    hw = hardware_report()
+    raw = to_rgb_uint8(sketch_image)
 
-    timer: Dict[str, float] = {}
-    result: Dict[str, Any] = {}
+    log("1/5 Preprocess")
+    t0 = _now_timer()
+    pre = preprocess_sketch(raw)
+    timings["preprocess"] = round(_now_timer() - t0, 3)
+    _save_rgb(out / "01_sketch_clean.png", pre["processed"])
+    _save_rgb(out / "02_control_map.png", pre["control_map"])
 
-    # ---- Stage 1: Preprocess ----
-    with PipelineTimer("preprocess") as timer_pre:
-        preprocessed = preprocess_sketch(sketch_image)
-    timer["preprocess"] = timer_pre.elapsed
-    result["sketch"] = preprocessed["sketch"]
-    result["control_map"] = preprocessed["control_map"]
+    log("2/5 Stable Diffusion + ControlNet")
+    t0 = _now_timer()
+    gen = generate_image(
+        pre["control_map"],
+        prompt=prompt,
+        seed=seed,
+        control_scale=control_scale,
+    )
+    timings["generate"] = round(_now_timer() - t0, 3)
+    _save_rgb(out / "03_generated.png", gen["image"])
+    unload_generator()
 
-    # ---- Stage 2: Generate ----
-    with PipelineTimer("generate") as timer_gen:
-        generated = generate_image(
-            preprocessed["control_map"],
-            prompt=prompt,
-            seed=seed,
-        )
-    timer["generate"] = timer_gen.elapsed
-    result["generated_image"] = generated["image"]
-    result["generated_prompt"] = generated["prompt"]
+    log("3/5 Background removal")
+    t0 = _now_timer()
+    prepared = prepare_image(gen["image"])
+    timings["prepare"] = round(_now_timer() - t0, 3)
+    _save_rgb(out / "04_prepared.png", prepared["prepared_rgb"])
+    cv2.imwrite(str(out / "04_prepared_rgba.png"), cv2.cvtColor(prepared["prepared_rgba"], cv2.COLOR_RGBA2BGRA))
 
-    # ---- Stage 3: Prepare (background removal) ----
-    with PipelineTimer("prepare") as timer_prep:
-        rgba = remove_background(generated["image"])
-        prepared = center_and_scale_foreground(rgba)
-    timer["prepare"] = timer_prep.elapsed
-    result["prepared_image"] = prepared["prepared_rgb"]
-    result["foreground_mask"] = prepared["foreground_mask"]
+    log("4/5 InstantMesh reconstruction")
+    t0 = _now_timer()
+    recon = reconstruct_mesh(prepared["prepared_rgb"], output_dir=out, seed=seed)
+    timings["reconstruct"] = round(_now_timer() - t0, 3)
 
-    # ---- Stage 4: Reconstruct ----
-    with PipelineTimer("reconstruct") as timer_recon:
-        recon = reconstruct_mesh(
-            prepared["prepared_rgb"],
-            output_dir=str(out / "reconstruct"),
-        )
-    timer["reconstruct"] = timer_recon.elapsed
-    result["reconstruct_report"] = recon.get("report", {})
+    log("5/5 Validate + export")
+    t0 = _now_timer()
+    exported = export_assets(
+        recon["mesh_path"],
+        out,
+        texture_path=recon.get("texture_path"),
+    )
+    timings["export"] = round(_now_timer() - t0, 3)
 
-    if recon.get("mesh_path"):
-        result["mesh_path"] = recon["mesh_path"]
+    # Keep InstantMesh texture next to the canonical names if present.
+    if recon.get("texture_path"):
+        src = Path(recon["texture_path"])
+        if src.is_file():
+            shutil.copy2(src, out / src.name)
 
-    # ---- Stage 5: Export ----
-    with PipelineTimer("export") as timer_exp:
-        mesh_data = {
-            "mesh": trimesh.load(result.get("mesh_path"), file_type="obj")
-            if result.get("mesh_path")
-            else None,
-            "texture_path": recon.get("texture_path"),
-        }
-        export_result = export_pipeline(mesh_data, output_dir=str(out))
-    timer["export"] = timer_exp.elapsed
-
-    result["glb_path"] = export_result["glb_path"]
-    result["obj_path"] = export_result["obj_path"]
-    result["report_json_path"] = export_result["report_json_path"]
-    result["valid"] = export_result["valid"]
-    result["roundtrip_valid"] = export_result["roundtrip_valid"]
-    result["checks"] = export_result["checks"]
-
-    # Store timings in result
-    result["stages"] = timer
-
-    # Write consolidated report.json
-    final_report = {
-        "stages": timer,
-        "prompt": prompt or "none",
+    report = {
+        "prompt": prompt or None,
+        "effective_prompt": gen["prompt"],
         "seed": seed,
-        "valid": result["valid"],
-        "roundtrip_valid": result["roundtrip_valid"],
-        "checks": result["checks"],
-        "timings_seconds": timer,
+        "control_scale": control_scale,
+        "hardware": hw,
+        "timings_seconds": timings,
+        "total_seconds": round(sum(timings.values()), 3),
+        "mesh": exported["stats"],
+        "checks": exported["checks"],
+        "valid": exported["valid"],
+        "roundtrip_valid": exported["roundtrip_valid"],
+        "paths": {
+            "run_dir": str(out),
+            "glb": exported["glb_path"],
+            "obj": exported["obj_path"],
+            "sketch": str(out / "01_sketch_clean.png"),
+            "control_map": str(out / "02_control_map.png"),
+            "generated": str(out / "03_generated.png"),
+            "prepared": str(out / "04_prepared.png"),
+        },
+        "stages": list(STAGES),
+        "created_utc": datetime.now(timezone.utc).isoformat(),
     }
-
     report_path = out / "report.json"
-    with open(report_path, "w") as f:
-        json.dump(final_report, f, indent=2)
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-    result["report_json_path"] = report_path
-
-    return result
+    return {
+        "output_dir": str(out),
+        "report_json_path": str(report_path),
+        "glb_path": exported["glb_path"],
+        "obj_path": exported["obj_path"],
+        "valid": exported["valid"],
+        "roundtrip_valid": exported["roundtrip_valid"],
+        "checks": exported["checks"],
+        "stages": timings,
+        "report": report,
+        "sketch_path": str(out / "01_sketch_clean.png"),
+        "control_map_path": str(out / "02_control_map.png"),
+        "generated_path": str(out / "03_generated.png"),
+        "prepared_path": str(out / "04_prepared.png"),
+        "hardware": hw,
+    }
