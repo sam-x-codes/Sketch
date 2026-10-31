@@ -1,0 +1,28 @@
+# Core dependencies (verify versions match your Python/environment)
+numpy>=1.26.0
+torch>=2.1.0
+torchvision>=0.16.0
+torchaudio>=2.1.0
+
+# Computer vision
+opencv-python>=4.10.0
+
+# 3D and mesh
+trimesh>=3.0.0
+pyglet>=2.0.0
+
+# Gradio web UI
+gradio>=4.30.0
+
+# ML / Diffusion
+diffusers>=0.28.0
+
+# Accelerated attention (CPU-compatible)
+xformers>=0.0.22.post7
+
+# Background removal
+rembg
+
+# Note: setup.sh installs GPU-optimized versions (PyTorch cu121, xformers, 
+# controlnet-annotator, InstantMesh). This repo is configured for CPU validation 
+# and code structure verification. GPU runtime required for full pipeline.

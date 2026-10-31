@@ -1,0 +1,1 @@
+"""Sketch2Shape AI — From a 2D sketch to a 3D asset."""
